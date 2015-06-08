@@ -1,0 +1,322 @@
+
+{
+  "AWSTemplateFormatVersion" : "2010-09-09",
+
+  "Description" : "Launches a Kafka cluster that leverages Exhibitor to find zookeeper instances.",
+
+  "Parameters" : {
+    "InstanceType" : {
+      "Description" : "EC2 instance type",
+      "Type" : "String",
+      "Default" : "m3.large",
+      "AllowedValues" : [
+        "t2.micro", "t2.small", "t2.medium",
+        "m3.medium", "m3.large", "m3.xlarge", "m3.2xlarge",
+        "c4.large", "c4.xlarge", "c4.2xlarge", "c4.4xlarge", "c4.8xlarge",
+        "c3.large", "c3.xlarge", "c3.2xlarge", "c3.4xlarge", "c3.8xlarge",
+        "r3.large", "r3.xlarge", "r3.2xlarge", "r3.4xlarge", "r3.8xlarge",
+        "i2.xlarge", "i2.2xlarge", "i2.4xlarge", "i2.8xlarge",
+        "hs1.8xlarge", "g2.2xlarge"
+      ],
+      "ConstraintDescription" : "must be a valid, HVM-compatible EC2 instance type."
+    },
+    "KeyName" : {
+      "Description" : "Existing EC2 KeyPair to be associated with all cluster instances for SSH access. For default AMIs, log in as the 'ubuntu' user.",
+      "Type" : "AWS::EC2::KeyPair::KeyName"
+    },
+    "ClusterSize" : {
+      "Description" : "Number of nodes to launch",
+      "Type" : "Number",
+      "Default": 2
+    },
+    "DockerImage" : {
+      "Description" : "Path of the Kafka Docker image (format: '[<registry>[:<port>]/]<repository>:<version>')",
+      "Type" : "String",
+      "Default" : "wurstmeister/kafka:latest"
+    },
+
+    "Subnets" : {
+      "Description" : "List of VPC subnet IDs for the cluster. Note: must match up with the passed AvailabilityZones.",
+      "Type" : "List<AWS::EC2::Subnet::Id>"
+    },
+    "VpcId" : {
+      "Description" : "VPC associated with the provided subnets",
+      "Type" : "AWS::EC2::VPC::Id"
+    },
+    "AdminSecurityGroup" : {
+      "Description" : "Existing security group that should be granted administrative access to ZooKeeper (e.g., 'sg-123456')",
+      "Type" : "AWS::EC2::SecurityGroup::Id"
+    },
+    "AvailabilityZones": {
+      "Description" : "(Optional) If passed, only launch nodes in these AZs (e.g., 'us-east-1a,us-east-1b'). Note: these must match up with the passed Subnets.",
+      "Type" : "CommaDelimitedList",
+      "Default" : ""
+    },
+    "KafkaChroot": {
+      "Description": "The chroot (starting with /) for Kafka to use within zookeeper",
+      "Type": "String",
+      "Default": "/kafka"
+    },
+    "ExhibitorLoadBalancer": {
+      "Description": "Exhibitor load balancer DNS Name, in the form of http(s)://some-load.balancer.elb.amazonaws.com (no trailing slash).",
+      "Type": "String"
+    },
+    "ManagerDockerImage": {
+        "Type": "String",
+        "Description": "Docker image running kafka manager.",
+        "Default": "sheepkiller/kafka-manager"
+    },
+    "ManagerClusterSize" : {
+      "Description" : "Number of kafka manager nodes to launch",
+      "Type" : "Number",
+      "Default": 1
+    },
+    "ManagerInstanceType" : {
+      "Description" : "Kafka Manager EC2 instance type",
+      "Type" : "String",
+      "Default" : "t2.micro",
+      "AllowedValues" : [
+        "t2.micro", "t2.small", "t2.medium",
+        "m3.medium", "m3.large", "m3.xlarge", "m3.2xlarge",
+        "c4.large", "c4.xlarge", "c4.2xlarge", "c4.4xlarge", "c4.8xlarge",
+        "c3.large", "c3.xlarge", "c3.2xlarge", "c3.4xlarge", "c3.8xlarge",
+        "r3.large", "r3.xlarge", "r3.2xlarge", "r3.4xlarge", "r3.8xlarge",
+        "i2.xlarge", "i2.2xlarge", "i2.4xlarge", "i2.8xlarge",
+        "hs1.8xlarge", "g2.2xlarge"
+      ],
+      "ConstraintDescription" : "must be a valid, HVM-compatible EC2 instance type."
+    }
+  },
+
+  "Mappings" : {
+    "RegionMap" : {
+      "us-east-1" : {
+        "AMI" : "ami-96163afe"
+      },
+      "us-west-1" : {
+        "AMI" : "ami-117c9a55"
+      },
+      "us-west-2" : {
+        "AMI" : "ami-8d123ebd"
+      },
+      "eu-west-1" : {
+        "AMI" : "ami-8be47afc"
+      },
+      "ap-southeast-1" : {
+        "AMI" : "ami-64b88936"
+      },
+      "ap-southeast-2" : {
+        "AMI" : "ami-abf48491"
+      },
+      "ap-northeast-1" : {
+        "AMI" : "ami-3d62953d"
+      },
+      "sa-east-1" : {
+        "AMI" : "ami-db1fa7c6"
+      }
+    }
+  },
+
+  "Conditions" : {
+    "UseAllAvailabilityZones" : {"Fn::Equals" : [{ "Fn::Join" : ["", {"Ref" : "AvailabilityZones"} ]}, ""]}
+  },
+
+  "Resources" : {
+    "ManagerServerGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "AvailabilityZones" : {
+          "Fn::If" : [
+            "UseAllAvailabilityZones",
+            { "Fn::GetAZs": "AWS::Region" },
+            { "Ref" : "AvailabilityZones" }
+          ]
+        },
+        "LaunchConfigurationName" : { "Ref" : "KafkaManagerLaunchConfig" },
+        "MinSize" : "1",
+        "MaxSize" : "1",
+        "DesiredCapacity" : {"Ref": "ManagerClusterSize"},
+        "VPCZoneIdentifier" : { "Ref" : "Subnets" },
+        "Tags" : [
+          {
+            "Key" : "role",
+            "Value" : "kafka-manager",
+            "PropagateAtLaunch" : "true"
+          },
+          {
+            "Key": "Name",
+            "Value" : "Kafka Manager",
+            "PropagateAtLaunch" : "true"
+          }
+        ]
+      }
+    },
+
+    "ServerGroup" : {
+      "Type" : "AWS::AutoScaling::AutoScalingGroup",
+      "Properties" : {
+        "AvailabilityZones" : {
+          "Fn::If" : [
+            "UseAllAvailabilityZones",
+            { "Fn::GetAZs": "AWS::Region" },
+            { "Ref" : "AvailabilityZones" }
+          ]
+        },
+        "LaunchConfigurationName" : { "Ref" : "KafkaLaunchConfig" },
+        "MinSize" : "1",
+        "MaxSize" : "9",
+        "DesiredCapacity" : { "Ref" : "ClusterSize" },
+        "VPCZoneIdentifier" : { "Ref" : "Subnets" },
+        "Tags" : [
+          {
+            "Key" : "role",
+            "Value" : "kafka",
+            "PropagateAtLaunch" : "true"
+          },
+          {
+            "Key": "Name",
+            "Value" : "Kafka",
+            "PropagateAtLaunch" : "true"
+          }
+        ]
+      }
+    },
+
+    "KafkaLaunchConfig" : {
+      "Type" : "AWS::AutoScaling::LaunchConfiguration",
+      "Properties" : {
+        "KeyName" : { "Ref" : "KeyName" },
+        "ImageId" : { "Fn::FindInMap" : [ "RegionMap", { "Ref" : "AWS::Region" }, "AMI"] },
+        "SecurityGroups" : [ { "Ref" : "ServerSecurityGroup" }, { "Ref" : "AdminSecurityGroup" }  ],
+        "AssociatePublicIpAddress": "true",
+        "InstanceType" : { "Ref" : "InstanceType" },
+        "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+          "#!/bin/bash -ex\n",
+
+          "# Helper function\n",
+          "function error_exit\n",
+          "{\n",
+          "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WaitHandle" }, "'\n",
+          "  exit 1\n",
+          "}\n",
+
+          "curl -s http://stedolan.github.io/jq/download/linux64/jq > jq\n",
+          "chmod +x jq\n",
+
+          "# Set up kafka connection using exhibitor data\n",
+          "export EX_DATA=`curl -s ", {"Ref": "ExhibitorLoadBalancer"}, "/exhibitor/v1/cluster/list`\n",
+          "export ZK_PORT=`echo $EX_DATA | ./jq -r '.port'`\n",
+          "export ZK_HOSTS=`echo $EX_DATA | ./jq -r '.servers | join(\",\")'`:$ZK_PORT\n",
+          "export ZK_CONNECT=$ZK_HOSTS", {"Ref": "KafkaChroot"} , "\n",
+          "export IP=`curl -s http://169.254.169.254/latest/meta-data/local-ipv4`\n",
+
+          "# Set up and start the Kafka service\n",
+          "sudo docker pull ", { "Ref": "DockerImage" }, "\n",
+          "runit-service create kafka docker run -p 9092:9092",
+          " -e KAFKA_BROKER_ID=${IP##*.}",
+          " -e KAFKA_ADVERTISED_PORT=9092",
+          " -e KAFKA_ZOOKEEPER_CONNECT=$ZK_CONNECT",
+          " -e \"KAFKA_ADVERTISED_HOST_NAME=`ec2metadata --local-hostname`\"",
+          " ", { "Ref": "DockerImage" }, "\n",
+          "runit-service enable kafka\n",
+
+          "# All is well so signal success\n",
+          "cfn-signal -e 0 -r \"Stack setup complete\" '", { "Ref" : "WaitHandle" }, "'\n",
+
+          "#EOF"
+        ]]}}
+      }
+    },
+
+    "KafkaManagerLaunchConfig": {
+      "Type": "AWS::AutoScaling::LaunchConfiguration",
+      "Properties" : {
+          "KeyName" : { "Ref" : "KeyName" },
+          "ImageId" : { "Fn::FindInMap" : [ "RegionMap", { "Ref" : "AWS::Region" }, "AMI"] },
+          "SecurityGroups" : [ { "Ref" : "ServerSecurityGroup" }, { "Ref" : "AdminSecurityGroup" }  ],
+          "AssociatePublicIpAddress": "true",
+          "InstanceType" : {"Ref": "ManagerInstanceType"},
+          "UserData"       : { "Fn::Base64" : { "Fn::Join" : ["", [
+            "#!/bin/bash -ex\n",
+
+            "# Helper function\n",
+            "function error_exit\n",
+            "{\n",
+            "  cfn-signal -e 1 -r \"$1\" '", { "Ref" : "WaitHandle" }, "'\n",
+            "  exit 1\n",
+            "}\n",
+
+            "curl -s http://stedolan.github.io/jq/download/linux64/jq > jq\n",
+            "chmod +x jq\n",
+
+            "# Set up kafka connection using exhibitor data\n",
+            "export EX_DATA=`curl -s ", {"Ref": "ExhibitorLoadBalancer"}, "/exhibitor/v1/cluster/list`\n",
+            "export ZK_PORT=`echo $EX_DATA | ./jq '.port'`\n",
+            "export ZK_HOSTS=`echo $EX_DATA | ./jq '.servers | join(\",\")'`:$ZK_PORT\n",
+            "export ZK_CONNECT=$ZK_HOSTS", {"Ref": "KafkaChroot"} , "\n",
+
+            "# Set up and start the Kafka Manager service\n",
+            "sudo docker pull ", { "Ref": "DockerImage" }, "\n",
+            "runit-service create kafkamanager docker run -p 9000:9000",
+            " -e KAFKA_ZOOKEEPER_CONNECT=$ZK_CONNECT",
+            " -e ZK_HOSTS=$ZK_CONNECT",
+            " ", { "Ref": "ManagerDockerImage" }, "\n",
+            "runit-service enable kafkamanager\n",
+
+            "# All is well so signal success\n",
+            "cfn-signal -e 0 -r \"Stack setup complete\" '", { "Ref" : "WaitHandle" }, "'\n",
+
+            "#EOF"
+          ]]}}
+      }
+    },
+
+    "ClientSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "For ZooKeeper clients. Grants access to the associated ZooKeeper cluster.",
+        "VpcId" : { "Ref" : "VpcId" }
+      }
+    },
+
+    "ServerSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable Kafka and zookeeper access",
+        "VpcId" : { "Ref" : "VpcId" },
+        "SecurityGroupIngress" :
+          [ { "IpProtocol" : "tcp", "FromPort" : "9092", "ToPort" : "9092", "SourceSecurityGroupId" : { "Ref" : "LbSecurityGroup"} },
+            { "IpProtocol" : "tcp", "FromPort" : "2181", "ToPort" : "2181", "SourceSecurityGroupId" : { "Ref" : "ClientSecurityGroup"} },
+            { "IpProtocol" : "tcp", "FromPort" : "9092", "ToPort" : "9092", "SourceSecurityGroupId" : { "Ref" : "ClientSecurityGroup"} }]
+      }
+    },
+
+    "LbSecurityGroup" : {
+      "Type" : "AWS::EC2::SecurityGroup",
+      "Properties" : {
+        "GroupDescription" : "Enable Exhibitor access",
+        "VpcId" : { "Ref" : "VpcId" },
+        "SecurityGroupIngress" :
+          [ { "IpProtocol" : "tcp", "FromPort" : "80", "ToPort" : "80", "SourceSecurityGroupId" : { "Ref" : "ClientSecurityGroup"} } ]
+      }
+    },
+
+    "SecurityGroupIngress": {
+      "Type": "AWS::EC2::SecurityGroupIngress",
+      "Properties": {
+        "GroupId": { "Ref": "ServerSecurityGroup" },
+        "IpProtocol": "-1",
+        "FromPort": "0",
+        "ToPort": "65535",
+        "SourceSecurityGroupId": { "Ref": "ServerSecurityGroup" }
+      }
+    },
+
+    "WaitHandle" : {
+      "Type" : "AWS::CloudFormation::WaitConditionHandle"
+    }
+  },
+  "Outputs" : {
+
+  }
+}
